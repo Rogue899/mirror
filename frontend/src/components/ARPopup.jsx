@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useWebSocket } from '../hooks/useWebSocket'
 import GarmentRenderer from './GarmentRenderer'
+import FitProfileModal, { loadFitProfile, EU_SIZE_TO_CHEST_CM } from './FitProfileModal'
 
 // MediaPipe skeleton connections to draw
 const SKELETON_CONNECTIONS = [
@@ -67,6 +68,11 @@ function ARPopup({ product, onClose, onAddToCart }) {
   const [selectedSize, setSelectedSize] = useState(product.sizes?.[0] || 'M')
   const [sizeAutoSelected, setSizeAutoSelected] = useState(false)
 
+  // Fit profile: user-provided anthropometry (height, chest, waist, EU size).
+  // Loaded from localStorage on mount; if absent, the profile modal is shown.
+  const [fitProfile, setFitProfile] = useState(() => loadFitProfile())
+  const [profileModalOpen, setProfileModalOpen] = useState(() => !loadFitProfile())
+
   // "See Real Fit" (diffusion try-on) state
   const [tryonState, setTryonState] = useState('idle') // idle | loading | result | error
   const [tryonImage, setTryonImage] = useState(null)
@@ -87,14 +93,20 @@ function ARPopup({ product, onClose, onAddToCart }) {
     connected, disconnect,
   } = useWebSocket()
 
+  // The "Best Fit" the UI will highlight. Prefer the user's self-reported
+  // EU size when available (deterministic, no guessing), fall back to
+  // MediaPipe's shoulder-width heuristic otherwise.
+  const profileSize    = fitProfile && !fitProfile.skipped ? fitProfile.euSize : null
+  const effectiveRecommendedSize = profileSize || recommendedSize
+
   // Auto-select recommended size
   useEffect(() => {
-    if (!recommendedSize || sizeAutoSelected) return
-    if (product.sizes?.includes(recommendedSize)) {
-      setSelectedSize(recommendedSize)
+    if (!effectiveRecommendedSize || sizeAutoSelected) return
+    if (product.sizes?.includes(effectiveRecommendedSize)) {
+      setSelectedSize(effectiveRecommendedSize)
       setSizeAutoSelected(true)
     }
-  }, [recommendedSize, sizeAutoSelected, product.sizes])
+  }, [effectiveRecommendedSize, sizeAutoSelected, product.sizes])
 
   // Canvas refs
   const bgCanvasRef   = useRef(null)
@@ -228,6 +240,12 @@ function ARPopup({ product, onClose, onAddToCart }) {
 
   return (
     <>
+    <FitProfileModal
+      open={profileModalOpen}
+      initial={fitProfile}
+      onSave={(profile) => { setFitProfile(profile); setProfileModalOpen(false) }}
+      onSkip={() => { setFitProfile({ skipped: true }); setProfileModalOpen(false) }}
+    />
     <div className="ar-overlay">
       <div className="ar-popup">
         <button className="ar-close" onClick={handleClose}>&times;</button>
@@ -242,6 +260,7 @@ function ARPopup({ product, onClose, onAddToCart }) {
               posOffset={posOffset}
               rotOffset={rotOffset}
               scaleMult={scaleMult}
+              fitProfile={fitProfile}
             />
           </div>
           <canvas ref={maskCanvasRef} className="ar-layer ar-layer--person" width={640} height={480} />
@@ -262,10 +281,12 @@ function ARPopup({ product, onClose, onAddToCart }) {
                 <span className="ar-measurement-label">Hips</span>
                 <span className="ar-measurement-value">{(measurements.hip_width * 100).toFixed(0)} u</span>
               </div>
-              {recommendedSize && (
+              {effectiveRecommendedSize && (
                 <div className="ar-measurement-item ar-measurement-size">
-                  <span className="ar-measurement-label">Best Fit</span>
-                  <span className="ar-measurement-value ar-measurement-size-value">{recommendedSize}</span>
+                  <span className="ar-measurement-label">
+                    Best Fit {profileSize ? '(your profile)' : '(est.)'}
+                  </span>
+                  <span className="ar-measurement-value ar-measurement-size-value">{effectiveRecommendedSize}</span>
                 </div>
               )}
             </div>
@@ -298,16 +319,33 @@ function ARPopup({ product, onClose, onAddToCart }) {
             {product.sizes?.map((size) => (
               <button
                 key={size}
-                className={`size-btn ${selectedSize === size ? 'active' : ''} ${recommendedSize === size ? 'recommended' : ''}`}
+                className={`size-btn ${selectedSize === size ? 'active' : ''} ${effectiveRecommendedSize === size ? 'recommended' : ''}`}
                 onClick={() => setSelectedSize(size)}
-                title={recommendedSize === size ? 'Recommended for your body' : ''}
+                title={effectiveRecommendedSize === size
+                  ? (profileSize ? 'From your fit profile' : 'Recommended based on body shape')
+                  : ''}
               >
                 {size}
-                {recommendedSize === size && <span className="size-rec-dot" />}
+                {effectiveRecommendedSize === size && <span className="size-rec-dot" />}
               </button>
             ))}
           </div>
           <div className="ar-actions">
+            <button
+              onClick={() => setProfileModalOpen(true)}
+              style={{
+                background: fitProfile && !fitProfile.skipped ? '#7c3aed22' : 'transparent',
+                border: `1px solid ${fitProfile && !fitProfile.skipped ? '#7c3aed' : '#444'}`,
+                color: fitProfile && !fitProfile.skipped ? '#c4b5fd' : '#888',
+                borderRadius: 6, padding: '6px 10px', fontSize: 11,
+                cursor: 'pointer', fontFamily: 'monospace',
+              }}
+              title="Edit your fit profile (height, chest, waist, EU size)"
+            >
+              {fitProfile && !fitProfile.skipped
+                ? `PROFILE · ${fitProfile.euSize}`
+                : 'FIT PROFILE'}
+            </button>
             <button
               onClick={() => setDebugMode(v => !v)}
               style={{

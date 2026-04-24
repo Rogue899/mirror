@@ -29,8 +29,21 @@ function midpointLm(a, b) {
   return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2, visibility: 1 }
 }
 
+// Convert user-provided anthropometry into per-axis scale multipliers so
+// the shirt matches real body proportions rather than landmark-estimated
+// ones. Baselines (ref*) correspond to a "typical M" body; user numbers
+// scale the shirt relative to those. Returns a multiplier in [0.85, 1.25].
+function fitProfileAxisMultipliers(profile) {
+  if (!profile || profile.skipped) return { width: 1, height: 1 }
+  const refChest  = 96   // cm
+  const refHeight = 170  // cm
+  const w = Math.max(0.85, Math.min(1.25, (profile.chest  || refChest)  / refChest))
+  const h = Math.max(0.85, Math.min(1.25, (profile.height || refHeight) / refHeight))
+  return { width: w, height: h }
+}
+
 /** Shared landmark tracking logic — used by both placeholder and real garment */
-function useLandmarkTracking(landmarks, group, posOffset = { x: 0, y: 0, z: 0 }, rotOffset = { x: 0, y: 0, z: 0 }, scaleMult = 1) {
+function useLandmarkTracking(landmarks, group, posOffset = { x: 0, y: 0, z: 0 }, rotOffset = { x: 0, y: 0, z: 0 }, scaleMult = 1, fitProfile = null) {
   const targetPos   = useRef(new THREE.Vector3())
   const targetScale = useRef(new THREE.Vector3(1, 1, 1))
   const targetQuat  = useRef(new THREE.Quaternion())
@@ -81,10 +94,15 @@ function useLandmarkTracking(landmarks, group, posOffset = { x: 0, y: 0, z: 0 },
     targetPos.current.z += posOffset.z
     group.current.position.lerp(targetPos.current, 0.3)
 
+    // Fit-profile multipliers: if the user entered real measurements,
+    // nudge the garment's width/height by how they compare to a typical
+    // "M" baseline (chest ≈ 96 cm, height ≈ 170 cm). The camera-estimated
+    // scale stays dominant; profile just corrects the baseline.
+    const fp = fitProfileAxisMultipliers(fitProfile)
     targetScale.current.set(
-      shoulderWidth * 1.30 * scaleMult,   // slightly wider than shoulders
-      torsoHeight   * 1.15 * scaleMult,   // mild vertical stretch so neck reaches shoulders
-      shoulderWidth * 0.65 * scaleMult    // front-to-back depth
+      shoulderWidth * 1.30 * scaleMult * fp.width,
+      torsoHeight   * 1.15 * scaleMult * fp.height,
+      shoulderWidth * 0.65 * scaleMult * fp.width
     )
     group.current.scale.lerp(targetScale.current, 0.25)
 
@@ -152,9 +170,9 @@ function useLandmarkTracking(landmarks, group, posOffset = { x: 0, y: 0, z: 0 },
  * GLB model is available. Proves the full AR pipeline works.
  * Replace with a real GLB by setting model_url on the product.
  */
-function PlaceholderGarment({ landmarks, posOffset, rotOffset, scaleMult }) {
+function PlaceholderGarment({ landmarks, posOffset, rotOffset, scaleMult, fitProfile }) {
   const group = useRef()
-  useLandmarkTracking(landmarks, group, posOffset, rotOffset, scaleMult)
+  useLandmarkTracking(landmarks, group, posOffset, rotOffset, scaleMult, fitProfile)
 
   return (
     <group ref={group}>
@@ -183,7 +201,7 @@ function PlaceholderGarment({ landmarks, posOffset, rotOffset, scaleMult }) {
 }
 
 /** Real garment loaded from a GLB/GLTF file */
-function GarmentModel({ modelUrl, landmarks, posOffset, rotOffset, scaleMult }) {
+function GarmentModel({ modelUrl, landmarks, posOffset, rotOffset, scaleMult, fitProfile }) {
   const gltf  = useLoader(GLTFLoader, modelUrl)
   const group = useRef()
 
@@ -226,7 +244,7 @@ function GarmentModel({ modelUrl, landmarks, posOffset, rotOffset, scaleMult }) 
     return { scene: front, sceneBack: back, center: c, invHeight: 1 / (size.y || 1) }
   }, [gltf])
 
-  useLandmarkTracking(landmarks, group, posOffset, rotOffset, scaleMult)
+  useLandmarkTracking(landmarks, group, posOffset, rotOffset, scaleMult, fitProfile)
 
   return (
     <group ref={group}>
@@ -246,7 +264,7 @@ function GarmentModel({ modelUrl, landmarks, posOffset, rotOffset, scaleMult }) 
   )
 }
 
-function GarmentRenderer({ modelUrl, landmarks, posOffset, rotOffset, scaleMult }) {
+function GarmentRenderer({ modelUrl, landmarks, posOffset, rotOffset, scaleMult, fitProfile }) {
   return (
     <Canvas
       style={{
@@ -269,8 +287,8 @@ function GarmentRenderer({ modelUrl, landmarks, posOffset, rotOffset, scaleMult 
 
       <Suspense fallback={null}>
         {modelUrl
-          ? <GarmentModel modelUrl={modelUrl} landmarks={landmarks} posOffset={posOffset} rotOffset={rotOffset} scaleMult={scaleMult} />
-          : <PlaceholderGarment landmarks={landmarks} posOffset={posOffset} rotOffset={rotOffset} scaleMult={scaleMult} />
+          ? <GarmentModel modelUrl={modelUrl} landmarks={landmarks} posOffset={posOffset} rotOffset={rotOffset} scaleMult={scaleMult} fitProfile={fitProfile} />
+          : <PlaceholderGarment landmarks={landmarks} posOffset={posOffset} rotOffset={rotOffset} scaleMult={scaleMult} fitProfile={fitProfile} />
         }
       </Suspense>
     </Canvas>
