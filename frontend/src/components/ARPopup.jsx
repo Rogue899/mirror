@@ -67,6 +67,12 @@ function ARPopup({ product, onClose, onAddToCart }) {
   const [selectedSize, setSelectedSize] = useState(product.sizes?.[0] || 'M')
   const [sizeAutoSelected, setSizeAutoSelected] = useState(false)
 
+  // "See Real Fit" (diffusion try-on) state
+  const [tryonState, setTryonState] = useState('idle') // idle | loading | result | error
+  const [tryonImage, setTryonImage] = useState(null)
+  const [tryonError, setTryonError] = useState(null)
+  const [tryonElapsed, setTryonElapsed] = useState(0)
+
   // Debug state
   const [debugMode, setDebugMode] = useState(false)
   const [posOffset, setPosOffset] = useState({ x: 0, y: 0, z: 0 })
@@ -97,13 +103,48 @@ function ARPopup({ product, onClose, onAddToCart }) {
   const camImgRef     = useRef(new Image())
   const maskImgRef    = useRef(new Image())
   // Layer 1: camera frame (throttled at WS source to ~10 fps)
+  // After drawing the camera frame we paint a semi-transparent dark polygon
+  // over the torso quad (LS/RS/LH/RH) so the user's own clothing doesn't
+  // visually compete with the 3D garment rendered on top. This is the
+  // "torso masking" trick from Snap's Lens Studio cloth-try-on pattern.
   useEffect(() => {
     if (!cameraFrame || !bgCanvasRef.current) return
     const canvas = bgCanvasRef.current
     const ctx = canvas.getContext('2d')
-    camImgRef.current.onload = () => ctx.drawImage(camImgRef.current, 0, 0, canvas.width, canvas.height)
+    const drawScene = () => {
+      ctx.drawImage(camImgRef.current, 0, 0, canvas.width, canvas.height)
+      if (!landmarks || landmarks.length < 29) return
+      const ls = landmarks[11], rs = landmarks[12]
+      const lh = landmarks[23], rh = landmarks[24]
+      if (!ls || !rs || !lh || !rh) return
+      if (ls.visibility < 0.55 || rs.visibility < 0.55 ||
+          lh.visibility < 0.55 || rh.visibility < 0.55) return
+      const W = canvas.width, H = canvas.height
+      // Expand the quad slightly outward so the darkening extends to the
+      // garment's silhouette, not just the landmark points themselves.
+      const padX = 0.06, padYTop = 0.05, padYBottom = 0.03
+      const poly = [
+        { x: (rs.x - padX) * W, y: (rs.y - padYTop)    * H }, // top-right
+        { x: (ls.x + padX) * W, y: (ls.y - padYTop)    * H }, // top-left
+        { x: (lh.x + padX) * W, y: (lh.y + padYBottom) * H }, // bottom-left
+        { x: (rh.x - padX) * W, y: (rh.y + padYBottom) * H }, // bottom-right
+      ]
+      ctx.save()
+      ctx.fillStyle = 'rgba(30, 30, 35, 0.72)'
+      ctx.beginPath()
+      ctx.moveTo(poly[0].x, poly[0].y)
+      for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i].x, poly[i].y)
+      ctx.closePath()
+      ctx.filter = 'blur(8px)'
+      ctx.fill()
+      ctx.restore()
+    }
+    camImgRef.current.onload = drawScene
     camImgRef.current.src = `data:image/jpeg;base64,${cameraFrame}`
-  }, [cameraFrame])
+    // If the image is already loaded (cached data URL), onload won't fire —
+    // fall back to drawing immediately when it's complete.
+    if (camImgRef.current.complete) drawScene()
+  }, [cameraFrame, landmarks])
 
   // Layer 3: person occlusion mask — DISABLED for now
   // MediaPipe's full-body mask covers the torso where the shirt should be visible.
@@ -148,6 +189,42 @@ function ARPopup({ product, onClose, onAddToCart }) {
   }, [landmarks])
 
   const handleClose = () => { disconnect(); onClose() }
+
+  // Tick an elapsed-time counter while the AI try-on runs so the user
+  // isn't staring at a frozen spinner for 60+ seconds.
+  useEffect(() => {
+    if (tryonState !== 'loading') return
+    setTryonElapsed(0)
+    const t0 = Date.now()
+    const id = setInterval(() => setTryonElapsed(Math.floor((Date.now() - t0) / 1000)), 250)
+    return () => clearInterval(id)
+  }, [tryonState])
+
+  const handleSeeRealFit = async () => {
+    if (!bgCanvasRef.current) return
+    // Snapshot the current camera frame as JPEG data URL
+    const snapshot = bgCanvasRef.current.toDataURL('image/jpeg', 0.92)
+    setTryonState('loading')
+    setTryonError(null)
+    setTryonImage(null)
+    try {
+      const resp = await fetch('/api/virtual-tryon', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_image: snapshot, product_id: product.id }),
+      })
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }))
+        throw new Error(err.detail || `HTTP ${resp.status}`)
+      }
+      const data = await resp.json()
+      setTryonImage(data.image)
+      setTryonState('result')
+    } catch (e) {
+      setTryonError(String(e.message || e))
+      setTryonState('error')
+    }
+  }
 
   return (
     <>
@@ -244,6 +321,15 @@ function ARPopup({ product, onClose, onAddToCart }) {
               {debugMode ? 'DEBUG ON' : 'DEBUG'}
             </button>
             <button className="btn btn-secondary" onClick={handleClose}>Switch Item</button>
+            <button
+              className="btn btn-primary"
+              onClick={handleSeeRealFit}
+              disabled={tryonState === 'loading' || !connected || landmarks.length === 0}
+              style={{ background: '#7c3aed', borderColor: '#7c3aed' }}
+              title="Generate a photorealistic preview of you wearing this item"
+            >
+              {tryonState === 'loading' ? `Generating… ${tryonElapsed}s` : '✨ See Real Fit'}
+            </button>
             <button className="btn btn-primary" onClick={() => onAddToCart(selectedSize)}>
               Add to Cart — {selectedSize}
             </button>
@@ -251,6 +337,90 @@ function ARPopup({ product, onClose, onAddToCart }) {
         </div>
       </div>
     </div>
+
+    {/* ── REAL-FIT RESULT MODAL ──────────────────────────────────── */}
+    {(tryonState === 'loading' || tryonState === 'result' || tryonState === 'error') && (
+      <div
+        style={{
+          position: 'fixed', inset: 0, zIndex: 20000,
+          background: 'rgba(0,0,0,0.85)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          padding: 24,
+        }}
+        onClick={() => tryonState !== 'loading' && setTryonState('idle')}
+      >
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            background: '#111', borderRadius: 12, padding: 20, maxWidth: 720,
+            color: '#fff', textAlign: 'center', border: '1px solid #333',
+            boxShadow: '0 20px 60px rgba(124,58,237,0.25)',
+          }}
+        >
+          <div style={{ fontSize: 14, color: '#a78bfa', letterSpacing: 2, marginBottom: 8, textTransform: 'uppercase' }}>
+            AI Real Fit
+          </div>
+          <div style={{ fontSize: 20, fontWeight: 600, marginBottom: 16 }}>
+            {product.name}
+          </div>
+
+          {tryonState === 'loading' && (
+            <div style={{ padding: '48px 24px' }}>
+              <div style={{
+                width: 56, height: 56, margin: '0 auto 24px',
+                border: '4px solid #333', borderTopColor: '#7c3aed',
+                borderRadius: '50%', animation: 'spin 1s linear infinite',
+              }} />
+              <div style={{ fontSize: 16, marginBottom: 8 }}>
+                Generating your real fit preview…
+              </div>
+              <div style={{ fontSize: 13, color: '#888' }}>
+                {tryonElapsed}s elapsed · typical 45–90s · AI try-on via HuggingFace
+              </div>
+              <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+            </div>
+          )}
+
+          {tryonState === 'result' && tryonImage && (
+            <>
+              <img
+                src={tryonImage}
+                alt="AI try-on result"
+                style={{ maxWidth: '100%', maxHeight: '70vh', borderRadius: 8, display: 'block', margin: '0 auto' }}
+              />
+              <div style={{ marginTop: 16, display: 'flex', gap: 8, justifyContent: 'center' }}>
+                <button className="btn btn-secondary" onClick={() => setTryonState('idle')}>Close</button>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => { onAddToCart(selectedSize); setTryonState('idle') }}
+                >
+                  Add to Cart — {selectedSize}
+                </button>
+              </div>
+            </>
+          )}
+
+          {tryonState === 'error' && (
+            <div style={{ padding: 24 }}>
+              <div style={{ color: '#f87171', fontSize: 16, marginBottom: 12 }}>
+                Couldn't generate preview
+              </div>
+              <div style={{ color: '#888', fontSize: 13, marginBottom: 20, wordBreak: 'break-word' }}>
+                {tryonError}
+              </div>
+              <button className="btn btn-secondary" onClick={() => setTryonState('idle')}>Close</button>
+              <button
+                className="btn btn-primary"
+                style={{ marginLeft: 8, background: '#7c3aed', borderColor: '#7c3aed' }}
+                onClick={handleSeeRealFit}
+              >
+                Try Again
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    )}
 
     {/* ── DEBUG SIDEBAR (fixed right panel, outside popup) ─────── */}
     {debugMode && <div style={{

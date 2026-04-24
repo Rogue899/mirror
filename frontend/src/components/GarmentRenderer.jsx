@@ -191,23 +191,39 @@ function GarmentModel({ modelUrl, landmarks, posOffset, rotOffset, scaleMult }) 
   // the resulting bounding box so we know the model's natural centre
   // and height. We normalise via nested groups (no vertex math) so the
   // GLTF loader's own parent transforms stay intact.
-  const { scene, center, invHeight } = useMemo(() => {
-    const clone = gltf.scene.clone(true)
-    const rotMatrix = new THREE.Matrix4().makeRotationY(Math.PI)
-    clone.traverse((node) => {
-      if (node.isMesh) {
-        if (node.geometry) node.geometry.applyMatrix4(rotMatrix)
-        node.castShadow    = true
-        node.receiveShadow = true
-        if (node.material) node.material.side = THREE.DoubleSide
-      }
-    })
-    clone.updateMatrixWorld(true)
-    const box  = new THREE.Box3().setFromObject(clone)
+  // Also build a `sceneBack` — the same mesh rotated 180° around Y —
+  // rendered as a second pass so the shirt stays visible when the user
+  // turns sideways (otherwise a flat-ish front panel goes edge-on).
+  const { scene, sceneBack, center, invHeight } = useMemo(() => {
+    const prepareClone = (flipped) => {
+      const clone = gltf.scene.clone(true)
+      const angle = flipped ? 0 : Math.PI
+      const rotMatrix = new THREE.Matrix4().makeRotationY(angle)
+      clone.traverse((node) => {
+        if (node.isMesh) {
+          if (node.geometry) node.geometry.applyMatrix4(rotMatrix)
+          node.castShadow    = true
+          node.receiveShadow = true
+          if (node.material) {
+            // Clone material so the back pass can be tinted/rendered
+            // differently without affecting the front pass.
+            node.material = node.material.clone()
+            node.material.side = THREE.DoubleSide
+          }
+        }
+      })
+      return clone
+    }
+
+    const front = prepareClone(false)
+    const back  = prepareClone(true)   // rotated 0° (default) so it faces +Z
+
+    front.updateMatrixWorld(true)
+    const box  = new THREE.Box3().setFromObject(front)
     const size = new THREE.Vector3(); box.getSize(size)
     const c    = new THREE.Vector3(); box.getCenter(c)
     console.log('[GLB] natural size:', size.toArray(), 'centre:', c.toArray())
-    return { scene: clone, center: c, invHeight: 1 / (size.y || 1) }
+    return { scene: front, sceneBack: back, center: c, invHeight: 1 / (size.y || 1) }
   }, [gltf])
 
   useLandmarkTracking(landmarks, group, posOffset, rotOffset, scaleMult)
@@ -220,6 +236,10 @@ function GarmentModel({ modelUrl, landmarks, posOffset, rotOffset, scaleMult }) 
       <group scale={[invHeight, invHeight, invHeight]}>
         <group position={[-center.x, -center.y, -center.z]}>
           <primitive object={scene} />
+        </group>
+        {/* Back-facing copy: becomes visible when body rotates sideways */}
+        <group position={[-center.x, -center.y, -center.z]}>
+          <primitive object={sceneBack} />
         </group>
       </group>
     </group>
@@ -239,9 +259,13 @@ function GarmentRenderer({ modelUrl, landmarks, posOffset, rotOffset, scaleMult 
       camera={{ position: [0, 0, 3], fov: 55 }}
       gl={{ alpha: true, antialias: true }}
     >
-      <ambientLight intensity={0.9} />
-      <directionalLight position={[2, 4, 2]}   intensity={0.7} castShadow />
-      <directionalLight position={[-2, 2, -2]}  intensity={0.3} />
+      {/* Softer ambient + stronger key directional gives the shirt visible
+          shading and a slight AO feel, rather than the flat floodlit look
+          that makes it read as a sticker. */}
+      <ambientLight intensity={0.55} />
+      <directionalLight position={[2, 4, 2]}   intensity={1.15} castShadow />
+      <directionalLight position={[-2, 2, -2]} intensity={0.35} />
+      <hemisphereLight args={[0xf0f0ff, 0x303030, 0.35]} />
 
       <Suspense fallback={null}>
         {modelUrl

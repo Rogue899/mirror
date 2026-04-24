@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import products, cart, vision
+from routers import products, cart, vision, tryon
 from db.database import engine, Base
 
 # Create database tables
@@ -19,6 +19,7 @@ app.add_middleware(
 app.include_router(products.router, prefix="/api")
 app.include_router(cart.router, prefix="/api")
 app.include_router(vision.router)
+app.include_router(tryon.router, prefix="/api")
 
 
 @app.get("/api/health")
