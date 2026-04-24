@@ -69,7 +69,7 @@ function ARPopup({ product, onClose, onAddToCart }) {
 
   // Debug state
   const [debugMode, setDebugMode] = useState(false)
-  const [posOffset, setPosOffset] = useState({ x: 0, y: 0.25, z: 0 })
+  const [posOffset, setPosOffset] = useState({ x: 0, y: 0, z: 0 })
   const [rotOffset, setRotOffset] = useState({ x: 0, y: 0, z: 0 })
   const [scaleMult, setScaleMult] = useState(1.0)
   const [showGarmentPanel, setShowGarmentPanel] = useState(true)

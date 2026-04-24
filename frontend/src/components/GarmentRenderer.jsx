@@ -57,6 +57,13 @@ function useLandmarkTracking(landmarks, group, posOffset = { x: 0, y: 0, z: 0 },
     const shoulderMid = midpointLm(ls, rs)
     const hipMid      = midpointLm(lh, rh)
     const torsoCenter = midpointLm(shoulderMid, hipMid)
+    // Bias the anchor 25% toward the shoulder line so the shirt's neck
+    // lands near LS/RS, not stuck at the navel.
+    const anchor = {
+      x: torsoCenter.x * 0.75 + shoulderMid.x * 0.25,
+      y: torsoCenter.y * 0.75 + shoulderMid.y * 0.25,
+      z: torsoCenter.z * 0.75 + shoulderMid.z * 0.25,
+    }
 
     const lsV          = lmToVec3(ls)
     const rsV          = lmToVec3(rs)
@@ -65,7 +72,9 @@ function useLandmarkTracking(landmarks, group, posOffset = { x: 0, y: 0, z: 0 },
     const shoulderWidth = lsV.distanceTo(rsV)
     const torsoHeight   = shoulderMidV.distanceTo(hipMidV)
 
-    targetPos.current.copy(lmToVec3(torsoCenter))
+    // GLB is pre-normalised (centred at origin, natural height = 1 unit).
+    // Anchor + torsoHeight scale ⇒ shirt sits naturally on the torso.
+    targetPos.current.copy(lmToVec3(anchor))
     // Apply debug offset from sliders
     targetPos.current.x += posOffset.x
     targetPos.current.y += posOffset.y
@@ -73,19 +82,39 @@ function useLandmarkTracking(landmarks, group, posOffset = { x: 0, y: 0, z: 0 },
     group.current.position.lerp(targetPos.current, 0.3)
 
     targetScale.current.set(
-      shoulderWidth * 1.15 * scaleMult,
-      torsoHeight   * 1.05 * scaleMult,
-      shoulderWidth * 0.6  * scaleMult
+      shoulderWidth * 1.30 * scaleMult,   // slightly wider than shoulders
+      torsoHeight   * 1.15 * scaleMult,   // mild vertical stretch so neck reaches shoulders
+      shoulderWidth * 0.65 * scaleMult    // front-to-back depth
     )
     group.current.scale.lerp(targetScale.current, 0.25)
 
-    // Use quaternion slerp to avoid gimbal lock
-    const shoulderAngleZ = Math.atan2(rsV.y - lsV.y, rsV.x - lsV.x)
-    const lateralShift = hipMidV.x - shoulderMidV.x
+    // ── Robust rotation from shoulder geometry ──
+    // Z-axis (lean left/right): derived from the shoulder-line angle in
+    // screen space. Clamp to ±35° so a MediaPipe x-swap (body turned
+    // past ~70°) can't flip the shirt upside down.
+    const shouldersCrossed = rsV.x < lsV.x
+    let shoulderAngleZ = 0
+    if (!shouldersCrossed) {
+      const rawAngle = Math.atan2(rsV.y - lsV.y, rsV.x - lsV.x)
+      shoulderAngleZ = Math.max(-0.6, Math.min(0.6, rawAngle))
+    }
+
+    // Y-axis (body turn / twist): use the Z-difference between shoulders
+    // (MediaPipe's z is relative depth) — this stays stable even when
+    // the body rotates past 90°. Fall back to hip/shoulder X-shift.
+    const shoulderTwist = (rs.z - ls.z) * 1.8
+    const lateralShift  = hipMidV.x - shoulderMidV.x
+
     targetQuat.current.setFromEuler(
-      new THREE.Euler(rotOffset.x, lateralShift * 0.4 + rotOffset.y, shoulderAngleZ + rotOffset.z, 'YXZ')
+      new THREE.Euler(
+        rotOffset.x,
+        shoulderTwist + lateralShift * 0.4 + rotOffset.y,
+        shoulderAngleZ + rotOffset.z,
+        'YXZ'
+      )
     )
-    group.current.quaternion.slerp(targetQuat.current, 0.2)
+    // Snappier slerp so tilts track visibly — previous 0.2 was sluggish.
+    group.current.quaternion.slerp(targetQuat.current, 0.35)
 
     // ── DIAGNOSTIC LOG (every 60 frames ≈ once per second) ──
     logCounter.current++
@@ -158,34 +187,41 @@ function GarmentModel({ modelUrl, landmarks, posOffset, rotOffset, scaleMult }) 
   const gltf  = useLoader(GLTFLoader, modelUrl)
   const group = useRef()
 
-  const scene = useMemo(() => {
+  // Prepare scene once per GLB: bake front-face rotation, then measure
+  // the resulting bounding box so we know the model's natural centre
+  // and height. We normalise via nested groups (no vertex math) so the
+  // GLTF loader's own parent transforms stay intact.
+  const { scene, center, invHeight } = useMemo(() => {
     const clone = gltf.scene.clone(true)
-    // Bake 180° Y rotation into geometry vertices so it doesn't
-    // conflict with the tracking quaternion on the parent group
     const rotMatrix = new THREE.Matrix4().makeRotationY(Math.PI)
-    const wireframeMat = new THREE.LineBasicMaterial({ color: 0x00ff88, transparent: true, opacity: 0.6 })
     clone.traverse((node) => {
       if (node.isMesh) {
-        if (node.geometry) {
-          node.geometry.applyMatrix4(rotMatrix)
-          // Wireframe overlay for debug — shows mesh edges in green
-          const edges = new THREE.EdgesGeometry(node.geometry)
-          const lines = new THREE.LineSegments(edges, wireframeMat)
-          node.add(lines)
-        }
+        if (node.geometry) node.geometry.applyMatrix4(rotMatrix)
         node.castShadow    = true
         node.receiveShadow = true
         if (node.material) node.material.side = THREE.DoubleSide
       }
     })
-    return clone
+    clone.updateMatrixWorld(true)
+    const box  = new THREE.Box3().setFromObject(clone)
+    const size = new THREE.Vector3(); box.getSize(size)
+    const c    = new THREE.Vector3(); box.getCenter(c)
+    console.log('[GLB] natural size:', size.toArray(), 'centre:', c.toArray())
+    return { scene: clone, center: c, invHeight: 1 / (size.y || 1) }
   }, [gltf])
 
   useLandmarkTracking(landmarks, group, posOffset, rotOffset, scaleMult)
 
   return (
     <group ref={group}>
-      <primitive object={scene} />
+      {/* normalise the GLB to unit height, centred on origin, via pure
+          group transforms so we don't clobber anything the GLTF loader
+          may have set on the scene root itself. */}
+      <group scale={[invHeight, invHeight, invHeight]}>
+        <group position={[-center.x, -center.y, -center.z]}>
+          <primitive object={scene} />
+        </group>
+      </group>
     </group>
   )
 }
