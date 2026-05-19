@@ -5,7 +5,7 @@ import ProductCard from '../components/ProductCard'
 const CATEGORIES = ['All', 'Men', 'Women', 'Tops', 'Bottoms', 'Outerwear']
 
 function Landing() {
-  const { products, loading } = useProducts()
+  const { products, loading, demoMode } = useProducts()
   const [activeCategory, setActiveCategory] = useState('All')
   const [showWelcome, setShowWelcome] = useState(true)
 
@@ -28,6 +28,14 @@ function Landing() {
         </div>
       )}
 
+      <div className="landing-header">
+        <div>
+          <p className="landing-kicker">Smart Fit Mirror</p>
+          <h1 className="landing-title">Explore Our Collection</h1>
+        </div>
+        {demoMode && <span className="demo-badge">Demo catalog</span>}
+      </div>
+
       <div className="category-filters">
         {CATEGORIES.map((cat) => (
           <button
@@ -42,6 +50,8 @@ function Landing() {
 
       {loading ? (
         <div className="loading">Loading collection...</div>
+      ) : filtered.length === 0 ? (
+        <div className="empty-state">No items in this category.</div>
       ) : (
         <div className="product-grid">
           {filtered.map((product) => (

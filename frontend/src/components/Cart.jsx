@@ -1,10 +1,25 @@
-function Cart({ items, open, onClose, onRemove }) {
-  if (!open) return null
+import { useMemo, useState } from 'react'
+import ProductImage from './ProductImage'
 
+function buildCheckoutPattern(items, total) {
+  const seed = items.reduce(
+    (sum, item) => sum + item.product.id * item.quantity + item.size.length,
+    Math.round(total * 100)
+  )
+
+  return Array.from({ length: 49 }, (_, index) => ((index * 17 + seed) % 5) < 2)
+}
+
+function Cart({ items, open, onClose, onRemove }) {
+  const [checkoutOpen, setCheckoutOpen] = useState(false)
   const total = items.reduce(
     (sum, item) => sum + item.product.price * item.quantity,
     0
   )
+  const checkoutPattern = useMemo(() => buildCheckoutPattern(items, total), [items, total])
+  const checkoutCode = `SFM-${Math.round(total * 100).toString(36).toUpperCase()}`
+
+  if (!open) return null
 
   return (
     <div className="cart-overlay" onClick={onClose}>
@@ -26,7 +41,7 @@ function Cart({ items, open, onClose, onRemove }) {
                   key={`${item.product.id}-${item.size}`}
                   className="cart-item"
                 >
-                  <img src={item.product.image} alt={item.product.name} />
+                  <ProductImage product={item.product} />
                   <div className="cart-item-info">
                     <h4>{item.product.name}</h4>
                     <p>
@@ -45,7 +60,22 @@ function Cart({ items, open, onClose, onRemove }) {
             </div>
             <div className="cart-footer">
               <p className="cart-total">Total: ${total.toFixed(2)}</p>
-              <button className="btn btn-primary">Checkout</button>
+              {checkoutOpen && (
+                <div className="checkout-panel">
+                  <div className="checkout-qr" aria-label="Demo checkout code">
+                    {checkoutPattern.map((filled, index) => (
+                      <span key={index} className={filled ? 'filled' : ''} />
+                    ))}
+                  </div>
+                  <div>
+                    <span className="checkout-label">Demo checkout</span>
+                    <strong>{checkoutCode}</strong>
+                  </div>
+                </div>
+              )}
+              <button className="btn btn-primary" onClick={() => setCheckoutOpen((value) => !value)}>
+                {checkoutOpen ? 'Hide Checkout' : 'Show Checkout'}
+              </button>
             </div>
           </>
         )}

@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import ARPopup from '../components/ARPopup'
+import ProductImage from '../components/ProductImage'
+import { findDemoProduct } from '../data/demoProducts'
 
 function ProductDetail({ addToCart }) {
   const { id } = useParams()
@@ -9,16 +11,27 @@ function ProductDetail({ addToCart }) {
   const [selectedSize, setSelectedSize] = useState(null)
   const [showAR, setShowAR] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [demoMode, setDemoMode] = useState(false)
 
   useEffect(() => {
     fetch(`/api/products/${id}`)
-      .then((res) => res.json())
+      .then((res) => {
+        if (!res.ok) throw new Error(`Product API returned ${res.status}`)
+        return res.json()
+      })
       .then((data) => {
         setProduct(data)
+        setDemoMode(false)
         if (data.sizes?.length) setSelectedSize(data.sizes[0])
         setLoading(false)
       })
-      .catch(() => setLoading(false))
+      .catch(() => {
+        const fallbackProduct = findDemoProduct(id)
+        setProduct(fallbackProduct)
+        if (fallbackProduct?.sizes?.length) setSelectedSize(fallbackProduct.sizes[0])
+        setDemoMode(Boolean(fallbackProduct))
+        setLoading(false)
+      })
   }, [id])
 
   if (loading) return <div className="loading">Loading...</div>
@@ -32,11 +45,12 @@ function ProductDetail({ addToCart }) {
 
       <div className="product-detail-content">
         <div className="product-image-large">
-          <img src={product.image} alt={product.name} />
+          <ProductImage product={product} />
         </div>
 
         <div className="product-info">
           <h1 className="product-title">{product.name}</h1>
+          {demoMode && <span className="demo-badge product-demo-badge">Demo catalog</span>}
           <p className="product-price">${product.price.toFixed(2)}</p>
           <p className="product-description">{product.description}</p>
 

@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useWebSocket } from '../hooks/useWebSocket'
-import GarmentRenderer from './GarmentRenderer'
-import FitProfileModal, { loadFitProfile, EU_SIZE_TO_CHEST_CM } from './FitProfileModal'
+import GarmentRenderer, { DEFAULT_RIGGED_GARMENT_FIT } from './GarmentRenderer'
+import FitProfileModal, { loadFitProfile } from './FitProfileModal'
+import { BODY_RIG_LANDMARKS, computeBodyRigFrame } from '../lib/ar/bodyRig'
+import { createPendingGarmentAdapter, GARMENT_ASSET_CONTRACT } from '../lib/ar/garmentAdapter'
 
 // MediaPipe skeleton connections to draw
 const SKELETON_CONNECTIONS = [
@@ -24,6 +26,106 @@ const KEY_LM = [
   { idx: 15, label: 'L Wrist' },
   { idx: 16, label: 'R Wrist' },
 ]
+
+const TRYON_TIMEOUT_MS = Number(import.meta.env.VITE_TRYON_TIMEOUT_MS || 12000)
+const TORSO_MASK_ENABLED = import.meta.env.VITE_ENABLE_TORSO_MASK === '1'
+
+function toDegrees(radians) {
+  return (radians * 180) / Math.PI
+}
+
+function toCanvasPoint(landmark, width, height) {
+  return { x: landmark.x * width, y: landmark.y * height }
+}
+
+function strokeJointPath(context, start, end, radius) {
+  context.lineWidth = radius * 2
+  context.beginPath()
+  context.moveTo(start.x, start.y)
+  context.lineTo(end.x, end.y)
+  context.stroke()
+}
+
+function drawArmOcclusionLayer(context, sourceCanvas, maskImage, landmarks, width, height) {
+  if (!sourceCanvas || !Array.isArray(landmarks) || landmarks.length < 29) return
+
+  const lm = BODY_RIG_LANDMARKS
+  const leftShoulder = landmarks[lm.LEFT_SHOULDER]
+  const rightShoulder = landmarks[lm.RIGHT_SHOULDER]
+  const leftElbow = landmarks[lm.LEFT_ELBOW]
+  const rightElbow = landmarks[lm.RIGHT_ELBOW]
+  const leftWrist = landmarks[lm.LEFT_WRIST]
+  const rightWrist = landmarks[lm.RIGHT_WRIST]
+
+  if (!leftShoulder || !rightShoulder) return
+  if ((leftShoulder.visibility ?? 0) < 0.45 || (rightShoulder.visibility ?? 0) < 0.45) return
+
+  const shoulderSpan = Math.hypot(
+    (rightShoulder.x - leftShoulder.x) * width,
+    (rightShoulder.y - leftShoulder.y) * height
+  )
+
+  if (shoulderSpan < 24) return
+
+  const upperArmRadius = shoulderSpan * 0.12
+  const forearmRadius = shoulderSpan * 0.1
+  const jointRadius = shoulderSpan * 0.13
+  const headRadius = shoulderSpan * 0.28
+  const shoulderMid = {
+    x: (leftShoulder.x + rightShoulder.x) * 0.5,
+    y: (leftShoulder.y + rightShoulder.y) * 0.5,
+  }
+  const headCenter = {
+    x: shoulderMid.x * width,
+    y: shoulderMid.y * height - shoulderSpan * 0.34,
+  }
+
+  context.drawImage(sourceCanvas, 0, 0, width, height)
+  context.globalCompositeOperation = 'destination-in'
+  context.strokeStyle = '#000'
+  context.fillStyle = '#000'
+  context.lineCap = 'round'
+  context.lineJoin = 'round'
+  context.filter = 'blur(2px)'
+
+  const segments = [
+    [leftShoulder, leftElbow, upperArmRadius],
+    [leftElbow, leftWrist, forearmRadius],
+    [rightShoulder, rightElbow, upperArmRadius],
+    [rightElbow, rightWrist, forearmRadius],
+  ]
+
+  for (const [start, end, radius] of segments) {
+    if (!start || !end) continue
+    if ((start.visibility ?? 0) < 0.35 || (end.visibility ?? 0) < 0.35) continue
+    strokeJointPath(
+      context,
+      toCanvasPoint(start, width, height),
+      toCanvasPoint(end, width, height),
+      radius
+    )
+  }
+
+  for (const joint of [leftShoulder, rightShoulder, leftElbow, rightElbow, leftWrist, rightWrist]) {
+    if (!joint || (joint.visibility ?? 0) < 0.35) continue
+    const point = toCanvasPoint(joint, width, height)
+    context.beginPath()
+    context.arc(point.x, point.y, jointRadius, 0, Math.PI * 2)
+    context.fill()
+  }
+
+  context.beginPath()
+  context.arc(headCenter.x, headCenter.y, headRadius, 0, Math.PI * 2)
+  context.fill()
+
+  if (maskImage) {
+    context.filter = 'none'
+    context.drawImage(maskImage, 0, 0, width, height)
+  }
+
+  context.globalCompositeOperation = 'source-over'
+  context.filter = 'none'
+}
 
 // Reusable collapsible panel
 function DebugPanel({ title, color = '#00ff88', open, onToggle, children }) {
@@ -64,6 +166,59 @@ function SliderRow({ label, value, min, max, step = 0.01, onChange }) {
   )
 }
 
+function fillRoundedRect(context, left, top, width, height, radius) {
+  const right = left + width
+  const bottom = top + height
+  context.beginPath()
+  context.moveTo(left + radius, top)
+  context.lineTo(right - radius, top)
+  context.quadraticCurveTo(right, top, right, top + radius)
+  context.lineTo(right, bottom - radius)
+  context.quadraticCurveTo(right, bottom, right - radius, bottom)
+  context.lineTo(left + radius, bottom)
+  context.quadraticCurveTo(left, bottom, left, bottom - radius)
+  context.lineTo(left, top + radius)
+  context.quadraticCurveTo(left, top, left + radius, top)
+  context.closePath()
+  context.fill()
+}
+
+function createDemoTryonImage(sourceCanvas, product, selectedSize) {
+  if (!sourceCanvas || typeof document === 'undefined') return null
+
+  const previewCanvas = document.createElement('canvas')
+  previewCanvas.width = sourceCanvas.width || 640
+  previewCanvas.height = sourceCanvas.height || 480
+  const context = previewCanvas.getContext('2d')
+  context.drawImage(sourceCanvas, 0, 0, previewCanvas.width, previewCanvas.height)
+
+  const torsoWidth = previewCanvas.width * 0.34
+  const torsoHeight = previewCanvas.height * 0.38
+  const torsoLeft = (previewCanvas.width - torsoWidth) / 2
+  const torsoTop = previewCanvas.height * 0.27
+  const sleeveWidth = previewCanvas.width * 0.12
+  const sleeveHeight = previewCanvas.height * 0.15
+
+  context.fillStyle = 'rgba(43, 103, 210, 0.72)'
+  fillRoundedRect(context, torsoLeft, torsoTop, torsoWidth, torsoHeight, 26)
+  fillRoundedRect(context, torsoLeft - sleeveWidth, torsoTop + 26, sleeveWidth + 20, sleeveHeight, 22)
+  fillRoundedRect(context, torsoLeft + torsoWidth - 20, torsoTop + 26, sleeveWidth + 20, sleeveHeight, 22)
+
+  context.fillStyle = 'rgba(18, 35, 72, 0.42)'
+  fillRoundedRect(context, torsoLeft + 22, torsoTop + 18, torsoWidth - 44, 42, 18)
+
+  const badgeHeight = Math.max(56, previewCanvas.height * 0.11)
+  context.fillStyle = 'rgba(0, 0, 0, 0.68)'
+  context.fillRect(0, previewCanvas.height - badgeHeight, previewCanvas.width, badgeHeight)
+  context.fillStyle = 'rgba(255, 255, 255, 0.92)'
+  context.font = '14px system-ui, sans-serif'
+  context.fillText('Demo preview - live AI try-on unavailable', 18, previewCanvas.height - badgeHeight + 22)
+  context.fillStyle = 'rgba(224, 201, 127, 0.95)'
+  context.fillText(`${product.name} / ${selectedSize}`, 18, previewCanvas.height - badgeHeight + 44)
+
+  return previewCanvas.toDataURL('image/png')
+}
+
 function ARPopup({ product, onClose, onAddToCart }) {
   const [selectedSize, setSelectedSize] = useState(product.sizes?.[0] || 'M')
   const [sizeAutoSelected, setSizeAutoSelected] = useState(false)
@@ -78,19 +233,25 @@ function ARPopup({ product, onClose, onAddToCart }) {
   const [tryonImage, setTryonImage] = useState(null)
   const [tryonError, setTryonError] = useState(null)
   const [tryonElapsed, setTryonElapsed] = useState(0)
+  const [tryonMode, setTryonMode] = useState(null)
+  const [tryonNotice, setTryonNotice] = useState(null)
 
   // Debug state
   const [debugMode, setDebugMode] = useState(false)
   const [posOffset, setPosOffset] = useState({ x: 0, y: 0, z: 0 })
   const [rotOffset, setRotOffset] = useState({ x: 0, y: 0, z: 0 })
   const [scaleMult, setScaleMult] = useState(1.0)
+  const [riggedFit, setRiggedFit] = useState(DEFAULT_RIGGED_GARMENT_FIT)
   const [showGarmentPanel, setShowGarmentPanel] = useState(true)
   const [showLandmarkPanel, setShowLandmarkPanel] = useState(true)
+  const [showRigPanel, setShowRigPanel] = useState(true)
+  const [showAssetPanel, setShowAssetPanel] = useState(true)
+  const [assetState, setAssetState] = useState(() => createPendingGarmentAdapter(product.model_url || null))
 
   const {
     landmarks, cameraFrame, segMask,
     measurements, recommendedSize,
-    connected, disconnect,
+    connected, source, disconnect,
   } = useWebSocket()
 
   // The "Best Fit" the UI will highlight. Prefer the user's self-reported
@@ -98,6 +259,20 @@ function ARPopup({ product, onClose, onAddToCart }) {
   // MediaPipe's shoulder-width heuristic otherwise.
   const profileSize    = fitProfile && !fitProfile.skipped ? fitProfile.euSize : null
   const effectiveRecommendedSize = profileSize || recommendedSize
+  const bodyRigFrame = useMemo(
+    () =>
+      computeBodyRigFrame(landmarks, {
+        posOffset,
+        rotOffset,
+        scaleMult,
+        fitProfile,
+      }),
+    [fitProfile, landmarks, posOffset, rotOffset, scaleMult]
+  )
+
+  useEffect(() => {
+    setAssetState(createPendingGarmentAdapter(product.model_url || null))
+  }, [product.model_url])
 
   // Auto-select recommended size
   useEffect(() => {
@@ -115,10 +290,8 @@ function ARPopup({ product, onClose, onAddToCart }) {
   const camImgRef     = useRef(new Image())
   const maskImgRef    = useRef(new Image())
   // Layer 1: camera frame (throttled at WS source to ~10 fps)
-  // After drawing the camera frame we paint a semi-transparent dark polygon
-  // over the torso quad (LS/RS/LH/RH) so the user's own clothing doesn't
-  // visually compete with the 3D garment rendered on top. This is the
-  // "torso masking" trick from Snap's Lens Studio cloth-try-on pattern.
+  // Torso darkening was useful during alignment experiments, but it is off by
+  // default because it makes the demo look artificially tinted.
   useEffect(() => {
     if (!cameraFrame || !bgCanvasRef.current) return
     const canvas = bgCanvasRef.current
@@ -131,9 +304,8 @@ function ARPopup({ product, onClose, onAddToCart }) {
       if (!ls || !rs || !lh || !rh) return
       if (ls.visibility < 0.55 || rs.visibility < 0.55 ||
           lh.visibility < 0.55 || rh.visibility < 0.55) return
+      if (!TORSO_MASK_ENABLED) return
       const W = canvas.width, H = canvas.height
-      // Expand the quad slightly outward so the darkening extends to the
-      // garment's silhouette, not just the landmark points themselves.
       const padX = 0.06, padYTop = 0.05, padYBottom = 0.03
       const poly = [
         { x: (rs.x - padX) * W, y: (rs.y - padYTop)    * H }, // top-right
@@ -158,11 +330,35 @@ function ARPopup({ product, onClose, onAddToCart }) {
     if (camImgRef.current.complete) drawScene()
   }, [cameraFrame, landmarks])
 
-  // Layer 3: person occlusion mask — DISABLED for now
-  // MediaPipe's full-body mask covers the torso where the shirt should be visible.
-  // TODO: implement arm-only occlusion for proper depth layering.
-  // const drawPersonLayer = useCallback(() => { ... }, [])
-  // useEffect(() => { ... }, [segMask])
+  // Layer 3: practical occlusion without hiding the whole shirt.
+  // Arms, shoulders, wrists, and head are composited back over the garment.
+  useEffect(() => {
+    if (!maskCanvasRef.current) return
+
+    const canvas = maskCanvasRef.current
+    const context = canvas.getContext('2d')
+
+    const drawOcclusion = () => {
+      context.clearRect(0, 0, canvas.width, canvas.height)
+      drawArmOcclusionLayer(
+        context,
+        bgCanvasRef.current,
+        segMask && maskImgRef.current.complete ? maskImgRef.current : null,
+        landmarks,
+        canvas.width,
+        canvas.height
+      )
+    }
+
+    if (!segMask) {
+      drawOcclusion()
+      return
+    }
+
+    maskImgRef.current.onload = drawOcclusion
+    maskImgRef.current.src = `data:image/png;base64,${segMask}`
+    if (maskImgRef.current.complete) drawOcclusion()
+  }, [cameraFrame, landmarks, segMask])
 
   // Layer 4: skeleton overlay
   useEffect(() => {
@@ -170,6 +366,7 @@ function ARPopup({ product, onClose, onAddToCart }) {
     const canvas = skelCanvasRef.current
     const ctx = canvas.getContext('2d')
     ctx.clearRect(0, 0, canvas.width, canvas.height)
+    if (!debugMode) return
     if (!landmarks || landmarks.length < 29) return
     const W = canvas.width, H = canvas.height
 
@@ -198,7 +395,7 @@ function ARPopup({ product, onClose, onAddToCart }) {
       const lm = landmarks[idx]
       if (lm && lm.visibility > 0.4) ctx.fillText(label, lm.x * W + 6, lm.y * H - 4)
     }
-  }, [landmarks])
+  }, [debugMode, landmarks])
 
   const handleClose = () => { disconnect(); onClose() }
 
@@ -219,11 +416,16 @@ function ARPopup({ product, onClose, onAddToCart }) {
     setTryonState('loading')
     setTryonError(null)
     setTryonImage(null)
+    setTryonMode(null)
+    setTryonNotice(null)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), TRYON_TIMEOUT_MS)
     try {
       const resp = await fetch('/api/virtual-tryon', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_image: snapshot, product_id: product.id }),
+        signal: controller.signal,
+        body: JSON.stringify({ user_image: snapshot, product_id: product.id, size: selectedSize }),
       })
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({ detail: resp.statusText }))
@@ -231,10 +433,25 @@ function ARPopup({ product, onClose, onAddToCart }) {
       }
       const data = await resp.json()
       setTryonImage(data.image)
+      setTryonMode(data.mode || 'live')
+      setTryonNotice(data.message || null)
       setTryonState('result')
-    } catch (e) {
-      setTryonError(String(e.message || e))
+    } catch (error) {
+      const message = error.name === 'AbortError'
+        ? `Live try-on exceeded ${Math.round(TRYON_TIMEOUT_MS / 1000)} seconds.`
+        : String(error.message || error)
+      const fallbackImage = createDemoTryonImage(bgCanvasRef.current, product, selectedSize)
+      if (fallbackImage) {
+        setTryonImage(fallbackImage)
+        setTryonMode('demo')
+        setTryonNotice(`Demo fallback shown because live try-on is unavailable: ${message}`)
+        setTryonState('result')
+        return
+      }
+      setTryonError(message)
       setTryonState('error')
+    } finally {
+      clearTimeout(timeoutId)
     }
   }
 
@@ -252,6 +469,7 @@ function ARPopup({ product, onClose, onAddToCart }) {
 
         {/* ── VIEWPORT ─────────────────────────────────────────── */}
         <div className="ar-viewport">
+          {source === 'demo' && <div className="ar-mode-badge">Demo Vision</div>}
           <canvas ref={bgCanvasRef} className="ar-layer ar-layer--bg" width={640} height={480} />
           <div className="ar-layer ar-layer--garment">
             <GarmentRenderer
@@ -261,11 +479,14 @@ function ARPopup({ product, onClose, onAddToCart }) {
               rotOffset={rotOffset}
               scaleMult={scaleMult}
               fitProfile={fitProfile}
+              riggedFit={riggedFit}
+              debug={debugMode}
+              onAssetState={setAssetState}
             />
           </div>
           <canvas ref={maskCanvasRef} className="ar-layer ar-layer--person" width={640} height={480} />
           <canvas ref={skelCanvasRef} className="ar-layer" width={640} height={480}
-            style={{ zIndex: 10, pointerEvents: 'none' }} />
+            style={{ zIndex: 10, pointerEvents: 'none', display: debugMode ? 'block' : 'none' }} />
 
           {measurements && (
             <div className="ar-measurements">
@@ -366,10 +587,10 @@ function ARPopup({ product, onClose, onAddToCart }) {
               style={{ background: '#7c3aed', borderColor: '#7c3aed' }}
               title="Generate a photorealistic preview of you wearing this item"
             >
-              {tryonState === 'loading' ? `Generating… ${tryonElapsed}s` : '✨ See Real Fit'}
+              {tryonState === 'loading' ? `Generating... ${tryonElapsed}s` : 'See Real Fit'}
             </button>
             <button className="btn btn-primary" onClick={() => onAddToCart(selectedSize)}>
-              Add to Cart — {selectedSize}
+              Add to Cart - {selectedSize}
             </button>
           </div>
         </div>
@@ -401,6 +622,11 @@ function ARPopup({ product, onClose, onAddToCart }) {
           <div style={{ fontSize: 20, fontWeight: 600, marginBottom: 16 }}>
             {product.name}
           </div>
+          {tryonNotice && (
+            <div className="ar-tryon-notice">
+              {tryonMode === 'demo' ? 'Demo fallback' : 'Live result'}: {tryonNotice}
+            </div>
+          )}
 
           {tryonState === 'loading' && (
             <div style={{ padding: '48px 24px' }}>
@@ -410,10 +636,10 @@ function ARPopup({ product, onClose, onAddToCart }) {
                 borderRadius: '50%', animation: 'spin 1s linear infinite',
               }} />
               <div style={{ fontSize: 16, marginBottom: 8 }}>
-                Generating your real fit preview…
+                Generating your real fit preview...
               </div>
               <div style={{ fontSize: 13, color: '#888' }}>
-                {tryonElapsed}s elapsed · typical 45–90s · AI try-on via HuggingFace
+                {tryonElapsed}s elapsed - typical 45-90s - AI try-on via HuggingFace
               </div>
               <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
             </div>
@@ -432,7 +658,7 @@ function ARPopup({ product, onClose, onAddToCart }) {
                   className="btn btn-primary"
                   onClick={() => { onAddToCart(selectedSize); setTryonState('idle') }}
                 >
-                  Add to Cart — {selectedSize}
+                  Add to Cart - {selectedSize}
                 </button>
               </div>
             </>
@@ -488,6 +714,19 @@ function ARPopup({ product, onClose, onAddToCart }) {
         <div style={{ color: '#00ff88', fontSize: 11, margin: '4px 0 2px' }}>Scale</div>
         <SliderRow label="Scale x" value={scaleMult} min={0.3} max={3}
           onChange={v => setScaleMult(v)} />
+        <div style={{ color: '#c084fc', fontSize: 11, margin: '4px 0 2px' }}>Rigged blouse fit</div>
+        <SliderRow label="Rig width" value={riggedFit.width} min={0.8} max={4} step={0.05}
+          onChange={v => setRiggedFit(p => ({ ...p, width: v }))} />
+        <SliderRow label="Rig height" value={riggedFit.height} min={0.7} max={2.2} step={0.05}
+          onChange={v => setRiggedFit(p => ({ ...p, height: v }))} />
+        <SliderRow label="Rig depth" value={riggedFit.depth} min={0.5} max={2.5} step={0.05}
+          onChange={v => setRiggedFit(p => ({ ...p, depth: v }))} />
+        <SliderRow label="Rig up" value={riggedFit.anchorUp} min={-0.5} max={0.7} step={0.02}
+          onChange={v => setRiggedFit(p => ({ ...p, anchorUp: v }))} />
+        <SliderRow label="Rig right" value={riggedFit.anchorRight} min={-0.5} max={0.5} step={0.02}
+          onChange={v => setRiggedFit(p => ({ ...p, anchorRight: v }))} />
+        <SliderRow label="Rig depth pos" value={riggedFit.anchorForward} min={-0.5} max={0.5} step={0.02}
+          onChange={v => setRiggedFit(p => ({ ...p, anchorForward: v }))} />
         <div style={{ color: '#ff88aa', fontSize: 11, margin: '4px 0 2px' }}>Rotation (rad)</div>
         <SliderRow label="Rot X (tilt)" value={rotOffset.x} min={-Math.PI} max={Math.PI}
           onChange={v => setRotOffset(r => ({ ...r, x: v }))} />
@@ -551,6 +790,148 @@ function ARPopup({ product, onClose, onAddToCart }) {
               })()}
             </tbody>
           </table>
+        )}
+      </DebugPanel>
+
+      <DebugPanel
+        title="Body Rig Frame"
+        color="#00d4ff"
+        open={showRigPanel}
+        onToggle={() => setShowRigPanel(v => !v)}
+      >
+        {!bodyRigFrame ? (
+          <div style={{ color: '#888' }}>Body rig unavailable - waiting for stable shoulders and hips</div>
+        ) : (
+          <table style={{ borderCollapse: 'collapse', fontSize: 11, fontFamily: 'monospace', width: '100%' }}>
+            <tbody>
+              <tr>
+                <td>Twist Y</td>
+                <td style={{ textAlign: 'right' }}>{toDegrees(bodyRigFrame.rotation.yaw).toFixed(1)}deg</td>
+              </tr>
+              <tr>
+                <td>Roll Z</td>
+                <td style={{ textAlign: 'right' }}>{toDegrees(bodyRigFrame.rotation.roll).toFixed(1)}deg</td>
+              </tr>
+              <tr>
+                <td>Pitch X</td>
+                <td style={{ textAlign: 'right' }}>{toDegrees(bodyRigFrame.rotation.pitch).toFixed(1)}deg</td>
+              </tr>
+              <tr>
+                <td>Shoulders</td>
+                <td style={{ textAlign: 'right' }}>{bodyRigFrame.widths.shoulder.toFixed(3)}</td>
+              </tr>
+              <tr>
+                <td>Hips</td>
+                <td style={{ textAlign: 'right' }}>{bodyRigFrame.widths.hip.toFixed(3)}</td>
+              </tr>
+              <tr>
+                <td>Torso</td>
+                <td style={{ textAlign: 'right' }}>{bodyRigFrame.lengths.torso.toFixed(3)}</td>
+              </tr>
+              <tr>
+                <td>Forward</td>
+                <td style={{ textAlign: 'right' }}>
+                  {bodyRigFrame.axes.forward.x.toFixed(2)} / {bodyRigFrame.axes.forward.y.toFixed(2)} / {bodyRigFrame.axes.forward.z.toFixed(2)}
+                </td>
+              </tr>
+              <tr>
+                <td>Anchor</td>
+                <td style={{ textAlign: 'right' }}>
+                  {bodyRigFrame.anchor.x.toFixed(2)} / {bodyRigFrame.anchor.y.toFixed(2)} / {bodyRigFrame.anchor.z.toFixed(2)}
+                </td>
+              </tr>
+              <tr>
+                <td>State</td>
+                <td style={{ textAlign: 'right', color: bodyRigFrame.crossedShoulders ? '#f84' : '#8f8' }}>
+                  {bodyRigFrame.crossedShoulders ? 'crossed' : 'stable'}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        )}
+      </DebugPanel>
+
+      <DebugPanel
+        title="Garment Asset"
+        color="#c084fc"
+        open={showAssetPanel}
+        onToggle={() => setShowAssetPanel(v => !v)}
+      >
+        <table style={{ borderCollapse: 'collapse', fontSize: 11, fontFamily: 'monospace', width: '100%' }}>
+          <tbody>
+            <tr>
+              <td>Mode</td>
+              <td style={{ textAlign: 'right', color: assetState.riggedReady ? '#8f8' : '#c4b5fd' }}>{assetState.mode}</td>
+            </tr>
+            <tr>
+              <td>Runtime</td>
+              <td style={{ textAlign: 'right', color: assetState.runtime?.mode === 'rigged-ready' ? '#8f8' : '#9ae6b4' }}>
+                {assetState.runtime?.mode || assetState.mode}
+              </td>
+            </tr>
+            <tr>
+              <td>Format</td>
+              <td style={{ textAlign: 'right' }}>{GARMENT_ASSET_CONTRACT.format}</td>
+            </tr>
+            <tr>
+              <td>Rigged Ready</td>
+              <td style={{ textAlign: 'right', color: assetState.riggedReady ? '#8f8' : '#f84' }}>
+                {assetState.riggedReady ? 'yes' : 'no'}
+              </td>
+            </tr>
+            <tr>
+              <td>Required Bones</td>
+              <td style={{ textAlign: 'right' }}>{GARMENT_ASSET_CONTRACT.skeleton.requiredRoles.length}</td>
+            </tr>
+            <tr>
+              <td>Missing Bones</td>
+              <td style={{ textAlign: 'right' }}>{assetState.missingRequiredRoles.length}</td>
+            </tr>
+            <tr>
+              <td>Forearms</td>
+              <td style={{ textAlign: 'right', color: assetState.optionalRoleCoverage?.forearmPair ? '#8f8' : '#fbbf24' }}>
+                {assetState.optionalRoleCoverage?.forearmPair ? 'pair' : 'partial / none'}
+              </td>
+            </tr>
+            <tr>
+              <td>Skinned Meshes</td>
+              <td style={{ textAlign: 'right' }}>{assetState.capabilities?.skinnedMeshCount ?? 0}</td>
+            </tr>
+            <tr>
+              <td>Skin Weights</td>
+              <td style={{ textAlign: 'right', color: assetState.capabilities?.hasSkinWeights ? '#8f8' : '#f84' }}>
+                {assetState.capabilities?.hasSkinWeights ? 'yes' : 'no'}
+              </td>
+            </tr>
+            <tr>
+              <td>Mesh Roles</td>
+              <td style={{ textAlign: 'right' }}>
+                {Object.entries(assetState.meshRoleCounts || {})
+                  .filter(([, count]) => count > 0)
+                  .map(([role, count]) => `${role}:${count}`)
+                  .join(' ') || 'none'}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        {!product.model_url && (
+          <div style={{ color: '#888', marginTop: 6 }}>
+            Waiting for a shirt asset. Drop in a rigged GLB/GLTF and this panel will inspect its skeleton contract.
+          </div>
+        )}
+
+        {Boolean(assetState.missingRequiredRoles.length) && (
+          <div style={{ color: '#fca5a5', marginTop: 6, wordBreak: 'break-word' }}>
+            Missing: {assetState.missingRequiredRoles.join(', ')}
+          </div>
+        )}
+
+        {Boolean(assetState.capabilities?.boneNames?.length) && (
+          <div style={{ color: '#aaa', marginTop: 6, wordBreak: 'break-word' }}>
+            Bones: {assetState.capabilities.boneNames.slice(0, 8).join(', ')}
+            {assetState.capabilities.boneNames.length > 8 ? ' ...' : ''}
+          </div>
         )}
       </DebugPanel>
     </div>}

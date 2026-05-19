@@ -1,0 +1,11 @@
+Model Information:
+title: Top01
+source: https://sketchfab.com/3d-models/top01-c3152460938b4a4191a82b52ad08af5b
+author: lil_lunamoth (https://sketchfab.com/lil_lunamoth)
+
+Model License:
+license type: CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+requirements: Author must be credited. Commercial use is allowed.
+
+Attribution:
+This work is based on "Top01" (https://sketchfab.com/3d-models/top01-c3152460938b4a4191a82b52ad08af5b) by lil_lunamoth (https://sketchfab.com/lil_lunamoth), licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/).

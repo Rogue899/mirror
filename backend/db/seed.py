@@ -81,6 +81,42 @@ SAMPLE_PRODUCTS = [
         "model_url": "",
         "sizes": ["S", "M", "L", "XL"],
     },
+    {
+        "name": "AR Test Jacket",
+        "price": 0.00,
+        "description": "Test garment with a real GLB model attached. Use this to validate the AR overlay pipeline end-to-end.",
+        "category": "Outerwear",
+        "image": "https://images.unsplash.com/photo-1551028719-00167b16eac5?w=400",
+        "model_url": "/garments/jacket.glb",
+        "sizes": ["S", "M", "L", "XL"],
+    },
+    {
+        "name": "Top01 Static Test Garment",
+        "price": 0.00,
+        "description": "Downloaded static GLB top for overlay testing. This is not rigged-ready yet because it has no skeleton or skin weights.",
+        "category": "Tops",
+        "image": "https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?w=400",
+        "model_url": "/garments/top01.glb",
+        "sizes": ["S", "M", "L", "XL"],
+    },
+    {
+        "name": "Meshy A-Pose Shirt Candidate",
+        "price": 0.00,
+        "description": "Generated from the Meshy preview API. This static GLB is useful for shape review before Blender rigging, but it has no skeleton or skin weights yet.",
+        "category": "Tops",
+        "image": "https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?w=400",
+        "model_url": "/garments/meshy-white-shirt-a-pose.glb",
+        "sizes": ["S", "M", "L", "XL"],
+    },
+    {
+        "name": "Business Lady Rigged Blouse",
+        "price": 0.00,
+        "description": "Rigged blouse converted from the Business Lady asset with FBX2glTF. Use this to validate the rigged-ready path and shoulder or arm driving.",
+        "category": "Tops",
+        "image": "https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?w=400",
+        "model_url": "/garments/business-lady-blouse-fbx2gltf.glb",
+        "sizes": ["S", "M", "L", "XL"],
+    },
 ]
 
 

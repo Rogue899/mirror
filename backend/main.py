@@ -1,16 +1,40 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers import products, cart, vision, tryon
-from db.database import engine, Base
+from db.database import engine, Base, SessionLocal
+from db.models import Product
+from db.seed import SAMPLE_PRODUCTS
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
+
+def seed_products_if_empty():
+    db = SessionLocal()
+    try:
+        if db.query(Product).count() > 0:
+            return
+        for item in SAMPLE_PRODUCTS:
+            db.add(Product(**item))
+        db.commit()
+    finally:
+        db.close()
+
+
+seed_products_if_empty()
+
 app = FastAPI(title="Smart Fit AI Mirror API")
+
+allowed_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

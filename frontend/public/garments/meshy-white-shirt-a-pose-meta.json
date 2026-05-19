@@ -1,0 +1,10 @@
+{
+  "source": "Meshy Text to 3D preview",
+  "task_id": "019e094c-3054-7f75-8528-c1008a01ce02",
+  "prompt": "plain white long sleeve shirt garment only, hollow wearable clothing, no body, no mannequin, neutral A-pose sleeves, front facing, clean symmetrical topology, realistic cotton fabric folds, centered at torso, suitable for virtual try on",
+  "target_polycount": 15000,
+  "topology": "quad",
+  "pose_mode": "a-pose",
+  "status": "SUCCEEDED",
+  "consumed_credits": 20
+}

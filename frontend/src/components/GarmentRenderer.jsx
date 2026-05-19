@@ -1,197 +1,306 @@
 import { Canvas, useFrame, useLoader } from '@react-three/fiber'
-import { useRef, useMemo, Suspense } from 'react'
+import { Suspense, useEffect, useMemo, useRef } from 'react'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader'
+import { clone as cloneSkinnedScene } from 'three/examples/jsm/utils/SkeletonUtils.js'
 import * as THREE from 'three'
+import { computeBodyRigFrame } from '../lib/ar/bodyRig'
+import { buildGarmentAdapter, createPendingGarmentAdapter } from '../lib/ar/garmentAdapter'
+import {
+  applyFallbackStaticDeformation,
+  applyFallbackStaticTransform,
+  applyRiggedSkeletonDriving,
+  solveBodyFrame,
+  solveGarmentPoseTargets,
+  summarizeGarmentRuntime,
+} from '../lib/ar/garmentRuntime'
 
-// MediaPipe Pose landmark indices
-const LM = {
-  LEFT_SHOULDER:  11,
-  RIGHT_SHOULDER: 12,
-  LEFT_ELBOW:     13,
-  RIGHT_ELBOW:    14,
-  LEFT_WRIST:     15,
-  RIGHT_WRIST:    16,
-  LEFT_HIP:       23,
-  RIGHT_HIP:      24,
-  LEFT_KNEE:      25,
-  RIGHT_KNEE:     26,
+export const DEFAULT_RIGGED_GARMENT_FIT = {
+  width: 2.55,
+  height: 1.22,
+  depth: 1.45,
+  anchorRight: 0,
+  anchorUp: 0.2,
+  anchorForward: 0.02,
 }
 
-function lmToVec3(lm) {
-  return new THREE.Vector3(
-    (lm.x - 0.5) * 4,
-    -(lm.y - 0.5) * 3,
-    lm.z * -1.5
-  )
+function resolveRiggedGarmentFit(fit) {
+  return {
+    ...DEFAULT_RIGGED_GARMENT_FIT,
+    ...(fit || {}),
+  }
 }
 
-function midpointLm(a, b) {
-  return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2, visibility: 1 }
+function runtimeStateKey(runtimeState) {
+  if (!runtimeState) return 'runtime:none'
+
+  return [
+    runtimeState.mode,
+    runtimeState.hasBodyFrame ? 'body' : 'nobody',
+    runtimeState.poseTargetsReady ? 'targets' : 'notargets',
+    runtimeState.forearmsReady ? 'forearms' : 'noforearms',
+    runtimeState.channelCount,
+  ].join(':')
 }
 
-// Convert user-provided anthropometry into per-axis scale multipliers so
-// the shirt matches real body proportions rather than landmark-estimated
-// ones. Baselines (ref*) correspond to a "typical M" body; user numbers
-// scale the shirt relative to those. Returns a multiplier in [0.85, 1.25].
-function fitProfileAxisMultipliers(profile) {
-  if (!profile || profile.skipped) return { width: 1, height: 1 }
-  const refChest  = 96   // cm
-  const refHeight = 170  // cm
-  const w = Math.max(0.85, Math.min(1.25, (profile.chest  || refChest)  / refChest))
-  const h = Math.max(0.85, Math.min(1.25, (profile.height || refHeight) / refHeight))
-  return { width: w, height: h }
-}
+function useGarmentRuntime({
+  adapter,
+  mirroredAdapters = [],
+  deformation = null,
+  hasAsset,
+  allowMockRig,
+  modelUrl,
+  landmarks,
+  group,
+  posOffset,
+  rotOffset,
+  scaleMult,
+  fitProfile,
+  riggedFit,
+  debug,
+  onAssetState,
+}) {
+  const logCounter = useRef(0)
+  const lastRuntimeKey = useRef('')
 
-/** Shared landmark tracking logic — used by both placeholder and real garment */
-function useLandmarkTracking(landmarks, group, posOffset = { x: 0, y: 0, z: 0 }, rotOffset = { x: 0, y: 0, z: 0 }, scaleMult = 1, fitProfile = null) {
-  const targetPos   = useRef(new THREE.Vector3())
-  const targetScale = useRef(new THREE.Vector3(1, 1, 1))
-  const targetQuat  = useRef(new THREE.Quaternion())
-  const logCounter  = useRef(0)
+  useEffect(() => {
+    if (!onAssetState || !adapter) return
+
+    const runtime = summarizeGarmentRuntime({
+      adapter,
+      bodyRigFrame: null,
+      poseTargets: null,
+      hasAsset,
+      mockRig: false,
+    })
+
+    lastRuntimeKey.current = runtimeStateKey(runtime)
+    onAssetState({ ...adapter, modelUrl, runtime })
+  }, [adapter, hasAsset, modelUrl, onAssetState])
 
   useFrame(() => {
-    if (!group.current || landmarks.length < 29) return
+    if (!group.current) return
 
-    const ls = landmarks[LM.LEFT_SHOULDER]
-    const rs = landmarks[LM.RIGHT_SHOULDER]
-    const lh = landmarks[LM.LEFT_HIP]
-    const rh = landmarks[LM.RIGHT_HIP]
+    const bodyRigFrame = solveBodyFrame({
+      landmarks,
+      options: {
+        posOffset,
+        rotOffset,
+        scaleMult,
+        fitProfile,
+      },
+    })
+    const poseTargets = solveGarmentPoseTargets(bodyRigFrame)
+    const resolvedRiggedFit = resolveRiggedGarmentFit(riggedFit)
 
-    // 0.65 threshold — matches backend min_tracking_confidence=0.6,
-    // gives reliable garment binding without false positives.
-    // Per MediaPipe docs: stand 2-4 metres from camera, front-facing.
-    if (
-      ls.visibility < 0.65 ||
-      rs.visibility < 0.65 ||
-      lh.visibility < 0.65 ||
-      rh.visibility < 0.65
-    ) return
+    if (bodyRigFrame) {
+      applyFallbackStaticTransform(group.current, bodyRigFrame, {
+        scaleEase: adapter?.riggedReady
+          ? {
+              x: resolvedRiggedFit.width,
+              y: resolvedRiggedFit.height,
+              z: resolvedRiggedFit.depth,
+            }
+          : undefined,
+        anchorOffset: adapter?.riggedReady
+          ? {
+              right: resolvedRiggedFit.anchorRight,
+              up: resolvedRiggedFit.anchorUp,
+              forward: resolvedRiggedFit.anchorForward,
+            }
+          : undefined,
+      })
 
-    const shoulderMid = midpointLm(ls, rs)
-    const hipMid      = midpointLm(lh, rh)
-    const torsoCenter = midpointLm(shoulderMid, hipMid)
-    // Bias the anchor 25% toward the shoulder line so the shirt's neck
-    // lands near LS/RS, not stuck at the navel.
-    const anchor = {
-      x: torsoCenter.x * 0.75 + shoulderMid.x * 0.25,
-      y: torsoCenter.y * 0.75 + shoulderMid.y * 0.25,
-      z: torsoCenter.z * 0.75 + shoulderMid.z * 0.25,
+      if (adapter?.riggedReady && poseTargets) {
+        applyRiggedSkeletonDriving(adapter, poseTargets)
+        mirroredAdapters.forEach((mirroredAdapter) => {
+          applyRiggedSkeletonDriving(mirroredAdapter, poseTargets)
+        })
+      } else if (deformation) {
+        applyFallbackStaticDeformation(deformation, bodyRigFrame)
+      }
     }
 
-    const lsV          = lmToVec3(ls)
-    const rsV          = lmToVec3(rs)
-    const shoulderMidV = lmToVec3(shoulderMid)
-    const hipMidV      = lmToVec3(hipMid)
-    const shoulderWidth = lsV.distanceTo(rsV)
-    const torsoHeight   = shoulderMidV.distanceTo(hipMidV)
+    const runtime = summarizeGarmentRuntime({
+      adapter,
+      bodyRigFrame,
+      poseTargets,
+      hasAsset,
+      mockRig: allowMockRig && Boolean(poseTargets),
+    })
+    const nextRuntimeKey = runtimeStateKey(runtime)
 
-    // GLB is pre-normalised (centred at origin, natural height = 1 unit).
-    // Anchor + torsoHeight scale ⇒ shirt sits naturally on the torso.
-    targetPos.current.copy(lmToVec3(anchor))
-    // Apply debug offset from sliders
-    targetPos.current.x += posOffset.x
-    targetPos.current.y += posOffset.y
-    targetPos.current.z += posOffset.z
-    group.current.position.lerp(targetPos.current, 0.3)
-
-    // Fit-profile multipliers: if the user entered real measurements,
-    // nudge the garment's width/height by how they compare to a typical
-    // "M" baseline (chest ≈ 96 cm, height ≈ 170 cm). The camera-estimated
-    // scale stays dominant; profile just corrects the baseline.
-    const fp = fitProfileAxisMultipliers(fitProfile)
-    targetScale.current.set(
-      shoulderWidth * 1.30 * scaleMult * fp.width,
-      torsoHeight   * 1.15 * scaleMult * fp.height,
-      shoulderWidth * 0.65 * scaleMult * fp.width
-    )
-    group.current.scale.lerp(targetScale.current, 0.25)
-
-    // ── Robust rotation from shoulder geometry ──
-    // Z-axis (lean left/right): derived from the shoulder-line angle in
-    // screen space. Clamp to ±35° so a MediaPipe x-swap (body turned
-    // past ~70°) can't flip the shirt upside down.
-    const shouldersCrossed = rsV.x < lsV.x
-    let shoulderAngleZ = 0
-    if (!shouldersCrossed) {
-      const rawAngle = Math.atan2(rsV.y - lsV.y, rsV.x - lsV.x)
-      shoulderAngleZ = Math.max(-0.6, Math.min(0.6, rawAngle))
+    if (onAssetState && adapter && nextRuntimeKey !== lastRuntimeKey.current) {
+      lastRuntimeKey.current = nextRuntimeKey
+      onAssetState({ ...adapter, modelUrl, runtime })
     }
 
-    // Y-axis (body turn / twist): use the Z-difference between shoulders
-    // (MediaPipe's z is relative depth) — this stays stable even when
-    // the body rotates past 90°. Fall back to hip/shoulder X-shift.
-    const shoulderTwist = (rs.z - ls.z) * 1.8
-    const lateralShift  = hipMidV.x - shoulderMidV.x
+    if (!debug || !bodyRigFrame) return
 
-    targetQuat.current.setFromEuler(
-      new THREE.Euler(
-        rotOffset.x,
-        shoulderTwist + lateralShift * 0.4 + rotOffset.y,
-        shoulderAngleZ + rotOffset.z,
-        'YXZ'
-      )
-    )
-    // Snappier slerp so tilts track visibly — previous 0.2 was sluggish.
-    group.current.quaternion.slerp(targetQuat.current, 0.35)
+    logCounter.current += 1
+    if (logCounter.current % 60 !== 0) return
 
-    // ── DIAGNOSTIC LOG (every 60 frames ≈ once per second) ──
-    logCounter.current++
-    if (logCounter.current % 60 === 0) {
-      console.log('[TRACK]', JSON.stringify({
-        // Raw MediaPipe landmarks (normalised 0-1)
-        raw: {
-          ls: { x: ls.x, y: ls.y, z: ls.z, vis: ls.visibility },
-          rs: { x: rs.x, y: rs.y, z: rs.z, vis: rs.visibility },
-          lh: { x: lh.x, y: lh.y, z: lh.z, vis: lh.visibility },
-          rh: { x: rh.x, y: rh.y, z: rh.z, vis: rh.visibility },
-        },
-        // Computed THREE.js values
-        computed: {
-          shoulderWidth: +shoulderWidth.toFixed(3),
-          torsoHeight: +torsoHeight.toFixed(3),
-          shoulderAngleZ: +(shoulderAngleZ * 180 / Math.PI).toFixed(1),
-          lateralShift: +lateralShift.toFixed(3),
-          shoulderZdiff: +(rs.z - ls.z).toFixed(4),
-        },
-        // Final applied transform
-        applied: {
-          pos: { x: +group.current.position.x.toFixed(3), y: +group.current.position.y.toFixed(3), z: +group.current.position.z.toFixed(3) },
-          scale: { x: +group.current.scale.x.toFixed(3), y: +group.current.scale.y.toFixed(3), z: +group.current.scale.z.toFixed(3) },
-        },
-        // Debug slider offsets
-        sliders: { posOffset, rotOffset, scaleMult },
-      }))
-    }
+    console.log('[BODY_RIG_FRAME]', {
+      version: bodyRigFrame.contractVersion,
+      widths: bodyRigFrame.widths,
+      lengths: bodyRigFrame.lengths,
+      rotation: bodyRigFrame.rotation,
+      forward: bodyRigFrame.axes.forward,
+      scale: bodyRigFrame.garmentScale,
+      riggedFit: adapter?.riggedReady ? resolvedRiggedFit : null,
+      crossedShoulders: bodyRigFrame.crossedShoulders,
+      runtime,
+    })
   })
 }
 
-/**
- * Placeholder garment — a simple T-shirt shaped mesh rendered when no
- * GLB model is available. Proves the full AR pipeline works.
- * Replace with a real GLB by setting model_url on the product.
- */
-function PlaceholderGarment({ landmarks, posOffset, rotOffset, scaleMult, fitProfile }) {
+function DebugLine({ start, end, color }) {
+  const geometry = useMemo(() => {
+    const lineGeometry = new THREE.BufferGeometry()
+    lineGeometry.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute(
+        [start.x, start.y, start.z, end.x, end.y, end.z],
+        3
+      )
+    )
+    return lineGeometry
+  }, [start.x, start.y, start.z, end.x, end.y, end.z])
+
+  useEffect(() => () => geometry.dispose(), [geometry])
+
+  return (
+    <line geometry={geometry}>
+      <lineBasicMaterial color={color} />
+    </line>
+  )
+}
+
+function DebugMarker({ point, color = '#ffffff', radius = 0.035 }) {
+  return (
+    <mesh position={[point.x, point.y, point.z]}>
+      <sphereGeometry args={[radius, 16, 16]} />
+      <meshBasicMaterial color={color} />
+    </mesh>
+  )
+}
+
+function DebugArrow({ start, end, color }) {
+  const direction = useMemo(
+    () => new THREE.Vector3(end.x - start.x, end.y - start.y, end.z - start.z),
+    [end.x, end.y, end.z, start.x, start.y, start.z]
+  )
+  const length = direction.length()
+  const midpoint = useMemo(
+    () => [
+      start.x + direction.x * 0.5,
+      start.y + direction.y * 0.5,
+      start.z + direction.z * 0.5,
+    ],
+    [direction.x, direction.y, direction.z, start.x, start.y, start.z]
+  )
+  const quaternion = useMemo(() => {
+    const q = new THREE.Quaternion()
+    q.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.clone().normalize())
+    return q
+  }, [direction])
+
+  if (length < 1e-4) return null
+
+  return (
+    <group>
+      <DebugLine start={start} end={end} color={color} />
+      <mesh position={midpoint} quaternion={quaternion}>
+        <cylinderGeometry args={[0.01, 0.01, Math.max(length - 0.1, 0.02), 10]} />
+        <meshBasicMaterial color={color} />
+      </mesh>
+      <mesh position={[end.x, end.y, end.z]} quaternion={quaternion}>
+        <coneGeometry args={[0.04, 0.12, 12]} />
+        <meshBasicMaterial color={color} />
+      </mesh>
+    </group>
+  )
+}
+
+function DebugRig({ landmarks, posOffset, rotOffset, scaleMult, fitProfile }) {
+  const frame = useMemo(
+    () =>
+      computeBodyRigFrame(landmarks, {
+        posOffset,
+        rotOffset,
+        scaleMult,
+        fitProfile,
+      }),
+    [fitProfile, landmarks, posOffset, rotOffset, scaleMult]
+  )
+
+  if (!frame) return null
+
+  const forwardLength = Math.max(frame.lengths.torso * 0.8, 0.45)
+  const forwardTip = {
+    x: frame.points.torsoCenter.x + frame.axes.forward.x * forwardLength,
+    y: frame.points.torsoCenter.y + frame.axes.forward.y * forwardLength,
+    z: frame.points.torsoCenter.z + frame.axes.forward.z * forwardLength,
+  }
+
+  return (
+    <group>
+      <DebugLine start={frame.points.leftShoulder} end={frame.points.rightShoulder} color="#00ff88" />
+      <DebugLine start={frame.points.leftHip} end={frame.points.rightHip} color="#ffaa00" />
+      <DebugLine start={frame.points.shoulderMid} end={frame.points.hipMid} color="#00d4ff" />
+      <DebugArrow start={frame.points.torsoCenter} end={forwardTip} color="#ff4fd8" />
+
+      <DebugMarker point={frame.points.leftShoulder} color="#00ff88" />
+      <DebugMarker point={frame.points.rightShoulder} color="#00ff88" />
+      <DebugMarker point={frame.points.leftHip} color="#ffaa00" />
+      <DebugMarker point={frame.points.rightHip} color="#ffaa00" />
+      <DebugMarker point={frame.anchor} color="#ffffff" radius={0.045} />
+    </group>
+  )
+}
+
+function PlaceholderGarment({
+  landmarks,
+  posOffset,
+  rotOffset,
+  scaleMult,
+  fitProfile,
+  riggedFit,
+  debug,
+  onAssetState,
+}) {
   const group = useRef()
-  useLandmarkTracking(landmarks, group, posOffset, rotOffset, scaleMult, fitProfile)
+  const pendingAdapter = useMemo(() => createPendingGarmentAdapter(), [])
+
+  useGarmentRuntime({
+    adapter: pendingAdapter,
+    hasAsset: false,
+    allowMockRig: true,
+    modelUrl: null,
+    landmarks,
+    group,
+    posOffset,
+    rotOffset,
+    scaleMult,
+    fitProfile,
+    riggedFit,
+    debug,
+    onAssetState,
+  })
 
   return (
     <group ref={group}>
-      {/* Torso body */}
       <mesh>
         <boxGeometry args={[1, 1.2, 0.25]} />
         <meshStandardMaterial color="#3b82f6" transparent opacity={0.75} />
       </mesh>
-      {/* Left sleeve */}
       <mesh position={[-0.7, 0.35, 0]}>
         <boxGeometry args={[0.4, 0.35, 0.22]} />
         <meshStandardMaterial color="#3b82f6" transparent opacity={0.75} />
       </mesh>
-      {/* Right sleeve */}
       <mesh position={[0.7, 0.35, 0]}>
         <boxGeometry args={[0.4, 0.35, 0.22]} />
         <meshStandardMaterial color="#3b82f6" transparent opacity={0.75} />
       </mesh>
-      {/* Collar */}
       <mesh position={[0, 0.65, 0]}>
         <torusGeometry args={[0.18, 0.06, 8, 16]} />
         <meshStandardMaterial color="#2563eb" />
@@ -200,71 +309,140 @@ function PlaceholderGarment({ landmarks, posOffset, rotOffset, scaleMult, fitPro
   )
 }
 
-/** Real garment loaded from a GLB/GLTF file */
-function GarmentModel({ modelUrl, landmarks, posOffset, rotOffset, scaleMult, fitProfile }) {
-  const gltf  = useLoader(GLTFLoader, modelUrl)
+function GarmentModel({
+  modelUrl,
+  landmarks,
+  posOffset,
+  rotOffset,
+  scaleMult,
+  fitProfile,
+  debug,
+  onAssetState,
+}) {
+  const gltf = useLoader(GLTFLoader, modelUrl)
   const group = useRef()
 
-  // Prepare scene once per GLB: bake front-face rotation, then measure
-  // the resulting bounding box so we know the model's natural centre
-  // and height. We normalise via nested groups (no vertex math) so the
-  // GLTF loader's own parent transforms stay intact.
-  // Also build a `sceneBack` — the same mesh rotated 180° around Y —
-  // rendered as a second pass so the shirt stays visible when the user
-  // turns sideways (otherwise a flat-ish front panel goes edge-on).
-  const { scene, sceneBack, center, invHeight } = useMemo(() => {
-    const prepareClone = (flipped) => {
-      const clone = gltf.scene.clone(true)
-      const angle = flipped ? 0 : Math.PI
-      const rotMatrix = new THREE.Matrix4().makeRotationY(angle)
+  const { sceneFront, center, invSize, deformation, adapter } = useMemo(() => {
+    const prepareClone = (rotationY) => {
+      const clone = cloneSkinnedScene(gltf.scene)
+      clone.rotation.y = rotationY
       clone.traverse((node) => {
-        if (node.isMesh) {
-          if (node.geometry) node.geometry.applyMatrix4(rotMatrix)
-          node.castShadow    = true
-          node.receiveShadow = true
-          if (node.material) {
-            // Clone material so the back pass can be tinted/rendered
-            // differently without affecting the front pass.
-            node.material = node.material.clone()
-            node.material.side = THREE.DoubleSide
-          }
+        if (!node.isMesh && !node.isSkinnedMesh) return
+        node.castShadow = true
+        node.receiveShadow = true
+
+        if (!node.material) return
+
+        if (Array.isArray(node.material)) {
+          node.material = node.material.map((material) => {
+            const nextMaterial = material.clone()
+            nextMaterial.side = THREE.DoubleSide
+            return nextMaterial
+          })
+          return
         }
+
+        node.material = node.material.clone()
+        node.material.side = THREE.DoubleSide
       })
       return clone
     }
 
-    const front = prepareClone(false)
-    const back  = prepareClone(true)   // rotated 0° (default) so it faces +Z
+    const front = prepareClone(Math.PI)
 
     front.updateMatrixWorld(true)
-    const box  = new THREE.Box3().setFromObject(front)
-    const size = new THREE.Vector3(); box.getSize(size)
-    const c    = new THREE.Vector3(); box.getCenter(c)
-    console.log('[GLB] natural size:', size.toArray(), 'centre:', c.toArray())
-    return { scene: front, sceneBack: back, center: c, invHeight: 1 / (size.y || 1) }
+    const box = new THREE.Box3().setFromObject(front)
+    const size = new THREE.Vector3()
+    const measuredCenter = new THREE.Vector3()
+    box.getSize(size)
+    box.getCenter(measuredCenter)
+
+    const nextAdapter = buildGarmentAdapter(front)
+    const nextDeformation = nextAdapter.mode === 'fallback-static'
+      ? (() => {
+          const meshData = []
+          let yMin = Infinity
+          let yMax = -Infinity
+
+          const capture = (root) => {
+            root.traverse((node) => {
+              if ((!node.isMesh && !node.isSkinnedMesh) || !node.geometry?.attributes?.position) return
+              const position = node.geometry.attributes.position
+              const original = new Float32Array(position.array.length)
+              original.set(position.array)
+              meshData.push({ mesh: node, original })
+
+              for (let index = 0; index < position.count; index += 1) {
+                const y = position.getY(index)
+                if (y < yMin) yMin = y
+                if (y > yMax) yMax = y
+              }
+            })
+          }
+
+          capture(front)
+
+          return {
+            meshData,
+            yMin,
+            yRange: (yMax - yMin) || 1,
+          }
+        })()
+      : null
+
+    return {
+      sceneFront: front,
+      center: measuredCenter,
+      invSize: [1 / (size.x || 1), 1 / (size.y || 1), 1 / (size.z || 1)],
+      deformation: nextDeformation,
+      adapter: nextAdapter,
+    }
   }, [gltf])
 
-  useLandmarkTracking(landmarks, group, posOffset, rotOffset, scaleMult, fitProfile)
+  useGarmentRuntime({
+    adapter,
+    mirroredAdapters: [],
+    deformation,
+    hasAsset: true,
+    allowMockRig: false,
+    modelUrl,
+    landmarks,
+    group,
+    posOffset,
+    rotOffset,
+    scaleMult,
+    fitProfile,
+    debug,
+    onAssetState,
+  })
+
+  useEffect(() => {
+    if (!debug) return
+    console.log('[GARMENT_ADAPTER]', adapter)
+  }, [adapter, debug])
 
   return (
     <group ref={group}>
-      {/* normalise the GLB to unit height, centred on origin, via pure
-          group transforms so we don't clobber anything the GLTF loader
-          may have set on the scene root itself. */}
-      <group scale={[invHeight, invHeight, invHeight]}>
+      <group scale={invSize}>
         <group position={[-center.x, -center.y, -center.z]}>
-          <primitive object={scene} />
-        </group>
-        {/* Back-facing copy: becomes visible when body rotates sideways */}
-        <group position={[-center.x, -center.y, -center.z]}>
-          <primitive object={sceneBack} />
+          <primitive object={sceneFront} />
         </group>
       </group>
     </group>
   )
 }
 
-function GarmentRenderer({ modelUrl, landmarks, posOffset, rotOffset, scaleMult, fitProfile }) {
+function GarmentRenderer({
+  modelUrl,
+  landmarks,
+  posOffset,
+  rotOffset,
+  scaleMult,
+  fitProfile,
+  riggedFit,
+  debug = false,
+  onAssetState,
+}) {
   return (
     <Canvas
       style={{
@@ -277,19 +455,45 @@ function GarmentRenderer({ modelUrl, landmarks, posOffset, rotOffset, scaleMult,
       camera={{ position: [0, 0, 3], fov: 55 }}
       gl={{ alpha: true, antialias: true }}
     >
-      {/* Softer ambient + stronger key directional gives the shirt visible
-          shading and a slight AO feel, rather than the flat floodlit look
-          that makes it read as a sticker. */}
       <ambientLight intensity={0.55} />
-      <directionalLight position={[2, 4, 2]}   intensity={1.15} castShadow />
+      <directionalLight position={[2, 4, 2]} intensity={1.15} castShadow />
       <directionalLight position={[-2, 2, -2]} intensity={0.35} />
       <hemisphereLight args={[0xf0f0ff, 0x303030, 0.35]} />
 
       <Suspense fallback={null}>
-        {modelUrl
-          ? <GarmentModel modelUrl={modelUrl} landmarks={landmarks} posOffset={posOffset} rotOffset={rotOffset} scaleMult={scaleMult} fitProfile={fitProfile} />
-          : <PlaceholderGarment landmarks={landmarks} posOffset={posOffset} rotOffset={rotOffset} scaleMult={scaleMult} fitProfile={fitProfile} />
-        }
+        {modelUrl ? (
+          <GarmentModel
+            modelUrl={modelUrl}
+            landmarks={landmarks}
+            posOffset={posOffset}
+            rotOffset={rotOffset}
+            scaleMult={scaleMult}
+            fitProfile={fitProfile}
+            riggedFit={riggedFit}
+            debug={debug}
+            onAssetState={onAssetState}
+          />
+        ) : (
+          <PlaceholderGarment
+            landmarks={landmarks}
+            posOffset={posOffset}
+            rotOffset={rotOffset}
+            scaleMult={scaleMult}
+            fitProfile={fitProfile}
+            debug={debug}
+            onAssetState={onAssetState}
+          />
+        )}
+
+        {debug && (
+          <DebugRig
+            landmarks={landmarks}
+            posOffset={posOffset}
+            rotOffset={rotOffset}
+            scaleMult={scaleMult}
+            fitProfile={fitProfile}
+          />
+        )}
       </Suspense>
     </Canvas>
   )
